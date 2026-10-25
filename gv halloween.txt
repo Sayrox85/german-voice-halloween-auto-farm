@@ -1,5 +1,7 @@
-local Players    = game:GetService("Players")
-local Workspace  = game:GetService("Workspace")
+local Players          = game:GetService("Players")
+local Workspace        = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+
 local LP = Players.LocalPlayer
 
 if _G.HalloweenFarm and _G.HalloweenFarm.stop then
@@ -7,17 +9,19 @@ if _G.HalloweenFarm and _G.HalloweenFarm.stop then
 end
 
 local SPAWN_ATTR    = "HalloweenHouseSpawnId"
+local HOUSE_PREFIX  = "HalloweenHouse"
 local RETURN_AFTER  = true
 local STREAM_WAIT   = 0.4
-local STAND_WAIT    = 0.08 
+local STAND_WAIT    = 0.08
 local MAX_LOG       = 100
 
 local state = {
-    log       = {},
-    processed = {},
-    farmed    = 0,
-    enabled   = true,
-    conns     = {},
+    log         = {},
+    processed   = {},
+    knownHouses = {},
+    farmed      = 0,
+    enabled     = true,
+    conns       = {},
 }
 _G.HalloweenFarm = state
 
@@ -29,6 +33,13 @@ end
 local function getHRP()
     local char = LP.Character or LP.CharacterAdded:Wait()
     return char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart", 5)
+end
+
+local function isHouse(inst)
+    if not inst:IsA("Model") then return false end
+    if inst:GetAttribute(SPAWN_ATTR) then return true end
+    if inst.Name:sub(1, #HOUSE_PREFIX) == HOUSE_PREFIX then return true end
+    return false
 end
 
 local function findDoorbell(house)
@@ -75,11 +86,11 @@ end
 local function fire(kind, target, anchor)
     local hrp = getHRP()
     if not hrp or not anchor or not anchor:IsA("BasePart") then
-        push("no HRP / bad anchor; abort")
+        push("no HRP or bad anchor; abort")
         return false
     end
-    local origin       = hrp.CFrame
-    local wasAnchored  = hrp.Anchored
+    local origin      = hrp.CFrame
+    local wasAnchored = hrp.Anchored
 
     hrp.Anchored = true
     hrp.AssemblyLinearVelocity  = Vector3.zero
@@ -111,55 +122,55 @@ end
 local function tryFarm(house)
     if not state.enabled then return end
     if not house:IsA("Model") then return end
+
+    for _ = 1, 20 do
+        if house:GetAttribute(SPAWN_ATTR) then break end
+        task.wait(0.1)
+        if not house.Parent then return end
+    end
     local id = house:GetAttribute(SPAWN_ATTR)
     if not id or state.processed[id] then return end
     state.processed[id] = true
 
     push("house "..tostring(id):sub(1,8).." scanning")
     task.wait(STREAM_WAIT)
-    if not house.Parent then
-        push("gone before fire; releasing lock")
+
+    if not state.enabled then
         state.processed[id] = nil
         return
     end
-    local kind, target, anchor = findDoorbell(house)
-    if not kind then
-        push("no interactable found; dumping prompts/clicks:")
-        for _, d in ipairs(house:GetDescendants()) do
-            if d:IsA("ProximityPrompt") or d:IsA("ClickDetector") then
-                push("  "..d.ClassName.." "..d:GetFullName())
-            end
-        end
+    if not house.Parent then
+        state.processed[id] = nil
         return
     end
 
+    local kind, target, anchor = findDoorbell(house)
+    if not kind then
+        push("no interactable found inside house")
+        return
+    end
     local ok = fire(kind, target, anchor)
     if ok then
         state.farmed = state.farmed + 1
-        push("rang via "..kind.." @ "..target:GetFullName())
+        push("rang via "..kind)
     else
         push("fire failed on "..kind)
     end
 end
 
-local function onAdded(d)
-    if not state.enabled then return end
-    if d:IsA("Model") then
-        if d:GetAttribute(SPAWN_ATTR) then
-            task.spawn(tryFarm, d)
-        else
-            local c
-            c = d:GetAttributeChangedSignal(SPAWN_ATTR):Connect(function()
-                if c then c:Disconnect(); c = nil end
-                if d:GetAttribute(SPAWN_ATTR) then task.spawn(tryFarm, d) end
-            end)
-            task.delay(10, function() if c then c:Disconnect(); c = nil end end)
-        end
-    end
+local function registerHouse(inst)
+    if state.knownHouses[inst] then return end
+    state.knownHouses[inst] = true
+    if state.enabled then task.spawn(tryFarm, inst) end
 end
 
-local function onRemoving(d)
-    if d:IsA("Model") then
+local function onChildAdded(d)
+    if isHouse(d) then registerHouse(d) end
+end
+
+local function onChildRemoved(d)
+    if state.knownHouses[d] then
+        state.knownHouses[d] = nil
         local id = d:GetAttribute(SPAWN_ATTR)
         if id then
             task.delay(8, function() state.processed[id] = nil end)
@@ -167,18 +178,225 @@ local function onRemoving(d)
     end
 end
 
-table.insert(state.conns, Workspace.DescendantAdded:Connect(onAdded))
-table.insert(state.conns, Workspace.DescendantRemoving:Connect(onRemoving))
+table.insert(state.conns, Workspace.ChildAdded:Connect(onChildAdded))
+table.insert(state.conns, Workspace.ChildRemoved:Connect(onChildRemoved))
 
-for _, d in ipairs(Workspace:GetDescendants()) do
-    if d:IsA("Model") and d:GetAttribute(SPAWN_ATTR) then
-        task.spawn(tryFarm, d)
+for _, d in ipairs(Workspace:GetChildren()) do
+    if isHouse(d) then registerHouse(d) end
+end
+
+local ORANGE     = Color3.fromRGB(255, 125, 30)
+local ORANGE_DIM = Color3.fromRGB(140, 70, 20)
+local BG         = Color3.fromRGB(22, 18, 28)
+local BG_LIGHT   = Color3.fromRGB(36, 28, 44)
+local TEXT       = Color3.fromRGB(240, 230, 220)
+local GREEN      = Color3.fromRGB(80, 200, 110)
+local RED        = Color3.fromRGB(220, 70, 70)
+
+local function mkCorner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 6)
+    c.Parent = parent
+    return c
+end
+local function mkStroke(parent, color, thick)
+    local s = Instance.new("UIStroke")
+    s.Color = color
+    s.Thickness = thick or 1
+    s.Parent = parent
+    return s
+end
+
+local guiParent
+local ok, hui = pcall(function() return gethui() end)
+if ok and hui then
+    guiParent = hui
+else
+    guiParent = game:GetService("CoreGui")
+end
+
+local existing = guiParent:FindFirstChild("HalloweenFarmGui")
+if existing then existing:Destroy() end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "HalloweenFarmGui"
+gui.IgnoreGuiInset = true
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = guiParent
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.fromOffset(220, 140)
+main.Position = UDim2.fromOffset(20, 120)
+main.BackgroundColor3 = BG
+main.BorderSizePixel = 0
+main.Active = true
+main.Parent = gui
+mkCorner(main, 8)
+mkStroke(main, ORANGE, 1)
+
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 26)
+titleBar.BackgroundColor3 = BG_LIGHT
+titleBar.BorderSizePixel = 0
+titleBar.Parent = main
+mkCorner(titleBar, 8)
+
+local titleFix = Instance.new("Frame")
+titleFix.Size = UDim2.new(1, 0, 0.5, 0)
+titleFix.Position = UDim2.fromScale(0, 0.5)
+titleFix.BackgroundColor3 = BG_LIGHT
+titleFix.BorderSizePixel = 0
+titleFix.Parent = titleBar
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -32, 1, 0)
+title.Position = UDim2.fromOffset(8, 0)
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextColor3 = ORANGE
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Text = "Halloween Farm"
+title.Parent = titleBar
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.fromOffset(22, 22)
+closeBtn.Position = UDim2.new(1, -24, 0, 2)
+closeBtn.BackgroundColor3 = BG
+closeBtn.BorderSizePixel = 0
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 14
+closeBtn.TextColor3 = TEXT
+closeBtn.Text = "x"
+closeBtn.AutoButtonColor = false
+closeBtn.Parent = titleBar
+mkCorner(closeBtn, 4)
+
+local toggle = Instance.new("TextButton")
+toggle.Size = UDim2.new(1, -16, 0, 28)
+toggle.Position = UDim2.fromOffset(8, 34)
+toggle.BackgroundColor3 = GREEN
+toggle.BorderSizePixel = 0
+toggle.Font = Enum.Font.GothamBold
+toggle.TextSize = 13
+toggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggle.Text = "ON"
+toggle.AutoButtonColor = false
+toggle.Parent = main
+mkCorner(toggle, 6)
+
+local function mkStat(y, labelText)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -16, 0, 14)
+    row.Position = UDim2.fromOffset(8, y)
+    row.BackgroundTransparency = 1
+    row.Parent = main
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(0, 55, 1, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 11
+    lbl.TextColor3 = ORANGE_DIM
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Text = labelText
+    lbl.Parent = row
+
+    local val = Instance.new("TextLabel")
+    val.Size = UDim2.new(1, -55, 1, 0)
+    val.Position = UDim2.fromOffset(55, 0)
+    val.BackgroundTransparency = 1
+    val.Font = Enum.Font.GothamMedium
+    val.TextSize = 11
+    val.TextColor3 = TEXT
+    val.TextXAlignment = Enum.TextXAlignment.Left
+    val.TextTruncate = Enum.TextTruncate.AtEnd
+    val.Text = "..."
+    val.Parent = row
+    return val
+end
+
+local statFarmed = mkStat(70, "Farmed")
+local statHouses = mkStat(88, "Houses")
+local statLast   = mkStat(106, "Last")
+
+local function applyEnabled(on)
+    state.enabled = on and true or false
+    if state.enabled then
+        toggle.Text = "ON"
+        toggle.BackgroundColor3 = GREEN
+        push("enabled")
+        for house in pairs(state.knownHouses) do
+            if house.Parent then task.spawn(tryFarm, house) end
+        end
+    else
+        toggle.Text = "OFF"
+        toggle.BackgroundColor3 = RED
+        push("disabled")
     end
 end
 
+function state.setEnabled(v) applyEnabled(v) end
+toggle.MouseButton1Click:Connect(function() applyEnabled(not state.enabled) end)
+
+do
+    local dragging, dragStart, startPos
+    titleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+           or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos  = main.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                        or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            main.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+end
+
 function state.stop()
+    if state.stopped then return end
+    state.stopped = true
     state.enabled = false
     for _, c in ipairs(state.conns) do pcall(function() c:Disconnect() end) end
     state.conns = {}
+    pcall(function()
+        local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+        if hrp then hrp.Anchored = false end
+    end)
+    if gui and gui.Parent then gui:Destroy() end
     push("stopped")
+    _G.HalloweenFarm = nil
 end
+closeBtn.MouseButton1Click:Connect(function() state.stop() end)
+
+task.spawn(function()
+    while gui.Parent do
+        local houses = 0
+        for h in pairs(state.knownHouses) do
+            if h.Parent then houses = houses + 1 end
+        end
+        statFarmed.Text = tostring(state.farmed)
+        statHouses.Text = tostring(houses)
+        local lastLine = state.log[#state.log]
+        if lastLine then
+            statLast.Text = lastLine:gsub("^%[[^%]]+%]%s*", "")
+        end
+        task.wait(1)
+    end
+end)
+
+push("auto-farm armed; waiting for houses")
