@@ -11,23 +11,35 @@ end
 local SPAWN_ATTR    = "HalloweenHouseSpawnId"
 local HOUSE_PREFIX  = "HalloweenHouse"
 local RETURN_AFTER  = true
-local STREAM_WAIT   = 0.4
-local STAND_WAIT    = 0.08
-local MAX_LOG       = 100
+local SETTLE_TIMEOUT = 6
+local SETTLE_EPS     = 0.02
+local SETTLE_TICKS   = 3
+local PRE_RING_WAIT = 0.1
+local RING_WAIT     = 0.35
+local TOUCH_RELEASE = 0.1
+local ATTR_TIMEOUT  = 2
+local MAX_LOG       = 60
+local GUI_REFRESH   = 1
 
 local state = {
-    log         = {},
-    processed   = {},
-    knownHouses = {},
-    farmed      = 0,
-    enabled     = true,
-    conns       = {},
+    log           = {},
+    processed     = {},
+    knownHouses   = setmetatable({}, { __mode = "k" }),
+    doorbellCache = setmetatable({}, { __mode = "k" }),
+    farmed        = 0,
+    houseCount    = 0,
+    enabled       = true,
+    stopped       = false,
+    dirty         = true,
+    conns         = {},
 }
 _G.HalloweenFarm = state
 
 local function push(msg)
-    table.insert(state.log, string.format("[%.1f] %s", os.clock(), msg))
-    if #state.log > MAX_LOG then table.remove(state.log, 1) end
+    local log = state.log
+    if #log >= MAX_LOG then table.remove(log, 1) end
+    log[#log + 1] = string.format("[%.1f] %s", os.clock(), msg)
+    state.dirty = true
 end
 
 local function getHRP()
@@ -35,57 +47,122 @@ local function getHRP()
     return char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart", 5)
 end
 
+local PREFIX_LEN = #HOUSE_PREFIX
 local function isHouse(inst)
     if not inst:IsA("Model") then return false end
-    if inst:GetAttribute(SPAWN_ATTR) then return true end
-    if inst.Name:sub(1, #HOUSE_PREFIX) == HOUSE_PREFIX then return true end
-    return false
+    if inst:GetAttribute(SPAWN_ATTR) ~= nil then return true end
+    return string.sub(inst.Name, 1, PREFIX_LEN) == HOUSE_PREFIX
+end
+
+local function waitForAttribute(inst, attr, timeout)
+    local v = inst:GetAttribute(attr)
+    if v ~= nil then return v end
+    local co = coroutine.running()
+    local resumed = false
+    local function resume()
+        if resumed then return end
+        resumed = true
+        task.spawn(co)
+    end
+    local conn = inst:GetAttributeChangedSignal(attr):Connect(resume)
+    task.delay(timeout, resume)
+    coroutine.yield()
+    conn:Disconnect()
+    return inst:GetAttribute(attr)
+end
+
+local function waitSettled(house)
+    local deadline = os.clock() + SETTLE_TIMEOUT
+    local last = house:GetPivot().Position
+    local still = 0
+    while os.clock() < deadline do
+        task.wait(0.1)
+        if not house.Parent then return false end
+        local p = house:GetPivot().Position
+        if (p - last).Magnitude < SETTLE_EPS then
+            still = still + 1
+            if still >= SETTLE_TICKS then return true end
+        else
+            still = 0
+        end
+        last = p
+    end
+    return house.Parent ~= nil
+end
+
+local function nameMatches(name)
+    local n = string.lower(name)
+    return string.find(n, "bell", 1, true)
+        or string.find(n, "button", 1, true)
+        or string.find(n, "ring", 1, true)
+        or string.find(n, "press", 1, true)
+end
+
+local function metaMatches(prompt)
+    local m = string.lower(prompt.ObjectText .. " " .. prompt.ActionText)
+    return string.find(m, "bell", 1, true) or string.find(m, "ring", 1, true)
 end
 
 local function findDoorbell(house)
-    local prompt, click, named
+    local c = state.doorbellCache[house]
+    if c then
+        if c.target.Parent and c.anchor.Parent then return c.kind, c.target, c.anchor end
+        state.doorbellCache[house] = nil
+    end
+
+    local named, namedAnchor, metaPrompt, metaAnchor
+    local firstPrompt, firstPromptAnchor, firstClick, firstClickAnchor
+
     for _, d in ipairs(house:GetDescendants()) do
-        local n = d.Name:lower()
-        if (d:IsA("ProximityPrompt") or d:IsA("ClickDetector") or d:IsA("BasePart"))
-           and (n:find("doorbell") or n:find("bell") or n:find("button") or n:find("ring") or n:find("press"))
-        then
-            named = named or d
-        elseif d:IsA("ProximityPrompt") then
-            prompt = prompt or d
-        elseif d:IsA("ClickDetector") then
-            click = click or d
+        local cls = d.ClassName
+        if cls == "ProximityPrompt" or cls == "ClickDetector" then
+            local p = d.Parent
+            if p and p:IsA("BasePart") then
+                if not named and nameMatches(d.Name) then
+                    named, namedAnchor = d, p
+                    break
+                end
+                if cls == "ProximityPrompt" then
+                    if not metaPrompt and metaMatches(d) then metaPrompt, metaAnchor = d, p end
+                    if not firstPrompt then firstPrompt, firstPromptAnchor = d, p end
+                elseif not firstClick then
+                    firstClick, firstClickAnchor = d, p
+                end
+            end
+        elseif not named and d:IsA("BasePart") and nameMatches(d.Name) then
+            named, namedAnchor = d, d
         end
     end
 
-    if not named then
-        for _, d in ipairs(house:GetDescendants()) do
-            if d:IsA("ProximityPrompt") then
-                local meta = (d.ObjectText or "")..(d.ActionText or "")
-                if meta:lower():find("doorbell") or meta:lower():find("ring") then
-                    named = d
-                    break
-                end
-            end
-        end
+    local function store(kind, target, anchor)
+        state.doorbellCache[house] = { kind = kind, target = target, anchor = anchor }
+        return kind, target, anchor
     end
 
     if named then
-        if named:IsA("ProximityPrompt") then return "prompt", named, named.Parent end
-        if named:IsA("ClickDetector")   then return "click",  named, named.Parent end
-        for _, c in ipairs(named:GetDescendants()) do
-            if c:IsA("ProximityPrompt") then return "prompt", c, named end
-            if c:IsA("ClickDetector")   then return "click",  c, named end
-        end
-        return "touch", named, named
+        if named:IsA("ProximityPrompt") then return store("prompt", named, namedAnchor) end
+        if named:IsA("ClickDetector")   then return store("click",  named, namedAnchor) end
+        local pp = named:FindFirstChildWhichIsA("ProximityPrompt", true)
+        if pp then return store("prompt", pp, named) end
+        local cd = named:FindFirstChildWhichIsA("ClickDetector", true)
+        if cd then return store("click", cd, named) end
+        if not metaPrompt then return store("touch", named, named) end
     end
-    if prompt then return "prompt", prompt, prompt.Parent end
-    if click  then return "click",  click,  click.Parent  end
+    if metaPrompt  then return store("prompt", metaPrompt,  metaAnchor)        end
+    if firstPrompt then return store("prompt", firstPrompt, firstPromptAnchor) end
+    if firstClick  then return store("click",  firstClick,  firstClickAnchor)  end
     return nil
 end
 
+local busy = false
+
 local function fire(kind, target, anchor)
+    while busy do task.wait(0.05) end
+    busy = true
+
     local hrp = getHRP()
     if not hrp or not anchor or not anchor:IsA("BasePart") then
+        busy = false
         push("no HRP or bad anchor; abort")
         return false
     end
@@ -96,50 +173,43 @@ local function fire(kind, target, anchor)
     hrp.AssemblyLinearVelocity  = Vector3.zero
     hrp.AssemblyAngularVelocity = Vector3.zero
     hrp.CFrame = anchor.CFrame * CFrame.new(0, 0, -2)
+    task.wait(PRE_RING_WAIT)
 
     local ok = false
     if kind == "prompt" then
-        ok = select(1, pcall(fireproximityprompt, target, 1))
-        task.wait(STAND_WAIT)
+        ok = pcall(fireproximityprompt, target, 1)
+        task.wait(RING_WAIT)
     elseif kind == "click" then
-        ok = select(1, pcall(fireclickdetector, target, 0, "MouseClick"))
-        task.wait(STAND_WAIT)
+        ok = pcall(fireclickdetector, target, 0, "MouseClick")
+        task.wait(RING_WAIT)
     elseif kind == "touch" then
-        ok = select(1, pcall(firetouchinterest, hrp, target, 0))
-        task.wait(0.05)
+        ok = pcall(firetouchinterest, hrp, target, 0)
+        task.wait(TOUCH_RELEASE)
         pcall(firetouchinterest, hrp, target, 1)
+        task.wait(RING_WAIT)
     end
 
-    if RETURN_AFTER then
+    if RETURN_AFTER and hrp.Parent then
         hrp.CFrame = origin
         hrp.AssemblyLinearVelocity  = Vector3.zero
         hrp.AssemblyAngularVelocity = Vector3.zero
     end
     hrp.Anchored = wasAnchored
+    busy = false
     return ok
 end
 
 local function tryFarm(house)
-    if not state.enabled then return end
-    if not house:IsA("Model") then return end
+    if not state.enabled or state.stopped or not house.Parent then return end
 
-    for _ = 1, 20 do
-        if house:GetAttribute(SPAWN_ATTR) then break end
-        task.wait(0.1)
-        if not house.Parent then return end
-    end
-    local id = house:GetAttribute(SPAWN_ATTR)
+    local id = waitForAttribute(house, SPAWN_ATTR, ATTR_TIMEOUT)
     if not id or state.processed[id] then return end
     state.processed[id] = true
 
-    push("house "..tostring(id):sub(1,8).." scanning")
-    task.wait(STREAM_WAIT)
+    push("house " .. tostring(id):sub(1, 8) .. " waiting to settle")
+    waitSettled(house)
 
-    if not state.enabled then
-        state.processed[id] = nil
-        return
-    end
-    if not house.Parent then
+    if not state.enabled or state.stopped or not house.Parent then
         state.processed[id] = nil
         return
     end
@@ -149,36 +219,37 @@ local function tryFarm(house)
         push("no interactable found inside house")
         return
     end
-    local ok = fire(kind, target, anchor)
-    if ok then
+    if fire(kind, target, anchor) then
         state.farmed = state.farmed + 1
-        push("rang via "..kind)
+        push("rang via " .. kind)
     else
-        push("fire failed on "..kind)
+        push("fire failed on " .. kind)
     end
 end
 
 local function registerHouse(inst)
     if state.knownHouses[inst] then return end
     state.knownHouses[inst] = true
+    state.houseCount = state.houseCount + 1
+    state.dirty = true
     if state.enabled then task.spawn(tryFarm, inst) end
 end
 
-local function onChildAdded(d)
-    if isHouse(d) then registerHouse(d) end
-end
-
 local function onChildRemoved(d)
-    if state.knownHouses[d] then
-        state.knownHouses[d] = nil
-        local id = d:GetAttribute(SPAWN_ATTR)
-        if id then
-            task.delay(8, function() state.processed[id] = nil end)
-        end
+    if not state.knownHouses[d] then return end
+    state.knownHouses[d] = nil
+    state.doorbellCache[d] = nil
+    state.houseCount = math.max(0, state.houseCount - 1)
+    state.dirty = true
+    local id = d:GetAttribute(SPAWN_ATTR)
+    if id then
+        task.delay(8, function() state.processed[id] = nil end)
     end
 end
 
-table.insert(state.conns, Workspace.ChildAdded:Connect(onChildAdded))
+table.insert(state.conns, Workspace.ChildAdded:Connect(function(d)
+    if isHouse(d) then registerHouse(d) end
+end))
 table.insert(state.conns, Workspace.ChildRemoved:Connect(onChildRemoved))
 
 for _, d in ipairs(Workspace:GetChildren()) do
@@ -208,8 +279,8 @@ local function mkStroke(parent, color, thick)
 end
 
 local guiParent
-local ok, hui = pcall(function() return gethui() end)
-if ok and hui then
+local okHui, hui = pcall(function() return gethui() end)
+if okHui and hui then
     guiParent = hui
 else
     guiParent = game:GetService("CoreGui")
@@ -356,7 +427,7 @@ do
             end)
         end
     end)
-    UserInputService.InputChanged:Connect(function(input)
+    table.insert(state.conns, UserInputService.InputChanged:Connect(function(input)
         if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
                         or input.UserInputType == Enum.UserInputType.Touch) then
             local delta = input.Position - dragStart
@@ -364,7 +435,7 @@ do
                 startPos.X.Scale, startPos.X.Offset + delta.X,
                 startPos.Y.Scale, startPos.Y.Offset + delta.Y)
         end
-    end)
+    end))
 end
 
 function state.stop()
@@ -378,24 +449,22 @@ function state.stop()
         if hrp then hrp.Anchored = false end
     end)
     if gui and gui.Parent then gui:Destroy() end
-    push("stopped")
     _G.HalloweenFarm = nil
 end
 closeBtn.MouseButton1Click:Connect(function() state.stop() end)
 
 task.spawn(function()
-    while gui.Parent do
-        local houses = 0
-        for h in pairs(state.knownHouses) do
-            if h.Parent then houses = houses + 1 end
+    while gui.Parent and not state.stopped do
+        if state.dirty then
+            state.dirty = false
+            statFarmed.Text = tostring(state.farmed)
+            statHouses.Text = tostring(state.houseCount)
+            local lastLine = state.log[#state.log]
+            if lastLine then
+                statLast.Text = (string.gsub(lastLine, "^%[[^%]]+%]%s*", ""))
+            end
         end
-        statFarmed.Text = tostring(state.farmed)
-        statHouses.Text = tostring(houses)
-        local lastLine = state.log[#state.log]
-        if lastLine then
-            statLast.Text = lastLine:gsub("^%[[^%]]+%]%s*", "")
-        end
-        task.wait(1)
+        task.wait(GUI_REFRESH)
     end
 end)
 
