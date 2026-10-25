@@ -1,0 +1,184 @@
+local Players    = game:GetService("Players")
+local Workspace  = game:GetService("Workspace")
+local LP = Players.LocalPlayer
+
+if _G.HalloweenFarm and _G.HalloweenFarm.stop then
+    pcall(_G.HalloweenFarm.stop)
+end
+
+local SPAWN_ATTR    = "HalloweenHouseSpawnId"
+local RETURN_AFTER  = true
+local STREAM_WAIT   = 0.4
+local STAND_WAIT    = 0.08 
+local MAX_LOG       = 100
+
+local state = {
+    log       = {},
+    processed = {},
+    farmed    = 0,
+    enabled   = true,
+    conns     = {},
+}
+_G.HalloweenFarm = state
+
+local function push(msg)
+    table.insert(state.log, string.format("[%.1f] %s", os.clock(), msg))
+    if #state.log > MAX_LOG then table.remove(state.log, 1) end
+end
+
+local function getHRP()
+    local char = LP.Character or LP.CharacterAdded:Wait()
+    return char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart", 5)
+end
+
+local function findDoorbell(house)
+    local prompt, click, named
+    for _, d in ipairs(house:GetDescendants()) do
+        local n = d.Name:lower()
+        if (d:IsA("ProximityPrompt") or d:IsA("ClickDetector") or d:IsA("BasePart"))
+           and (n:find("doorbell") or n:find("bell") or n:find("button") or n:find("ring") or n:find("press"))
+        then
+            named = named or d
+        elseif d:IsA("ProximityPrompt") then
+            prompt = prompt or d
+        elseif d:IsA("ClickDetector") then
+            click = click or d
+        end
+    end
+
+    if not named then
+        for _, d in ipairs(house:GetDescendants()) do
+            if d:IsA("ProximityPrompt") then
+                local meta = (d.ObjectText or "")..(d.ActionText or "")
+                if meta:lower():find("doorbell") or meta:lower():find("ring") then
+                    named = d
+                    break
+                end
+            end
+        end
+    end
+
+    if named then
+        if named:IsA("ProximityPrompt") then return "prompt", named, named.Parent end
+        if named:IsA("ClickDetector")   then return "click",  named, named.Parent end
+        for _, c in ipairs(named:GetDescendants()) do
+            if c:IsA("ProximityPrompt") then return "prompt", c, named end
+            if c:IsA("ClickDetector")   then return "click",  c, named end
+        end
+        return "touch", named, named
+    end
+    if prompt then return "prompt", prompt, prompt.Parent end
+    if click  then return "click",  click,  click.Parent  end
+    return nil
+end
+
+local function fire(kind, target, anchor)
+    local hrp = getHRP()
+    if not hrp or not anchor or not anchor:IsA("BasePart") then
+        push("no HRP / bad anchor; abort")
+        return false
+    end
+    local origin       = hrp.CFrame
+    local wasAnchored  = hrp.Anchored
+
+    hrp.Anchored = true
+    hrp.AssemblyLinearVelocity  = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+    hrp.CFrame = anchor.CFrame * CFrame.new(0, 0, -2)
+
+    local ok = false
+    if kind == "prompt" then
+        ok = select(1, pcall(fireproximityprompt, target, 1))
+        task.wait(STAND_WAIT)
+    elseif kind == "click" then
+        ok = select(1, pcall(fireclickdetector, target, 0, "MouseClick"))
+        task.wait(STAND_WAIT)
+    elseif kind == "touch" then
+        ok = select(1, pcall(firetouchinterest, hrp, target, 0))
+        task.wait(0.05)
+        pcall(firetouchinterest, hrp, target, 1)
+    end
+
+    if RETURN_AFTER then
+        hrp.CFrame = origin
+        hrp.AssemblyLinearVelocity  = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end
+    hrp.Anchored = wasAnchored
+    return ok
+end
+
+local function tryFarm(house)
+    if not state.enabled then return end
+    if not house:IsA("Model") then return end
+    local id = house:GetAttribute(SPAWN_ATTR)
+    if not id or state.processed[id] then return end
+    state.processed[id] = true
+
+    push("house "..tostring(id):sub(1,8).." scanning")
+    task.wait(STREAM_WAIT)
+    if not house.Parent then
+        push("gone before fire; releasing lock")
+        state.processed[id] = nil
+        return
+    end
+    local kind, target, anchor = findDoorbell(house)
+    if not kind then
+        push("no interactable found; dumping prompts/clicks:")
+        for _, d in ipairs(house:GetDescendants()) do
+            if d:IsA("ProximityPrompt") or d:IsA("ClickDetector") then
+                push("  "..d.ClassName.." "..d:GetFullName())
+            end
+        end
+        return
+    end
+
+    local ok = fire(kind, target, anchor)
+    if ok then
+        state.farmed = state.farmed + 1
+        push("rang via "..kind.." @ "..target:GetFullName())
+    else
+        push("fire failed on "..kind)
+    end
+end
+
+local function onAdded(d)
+    if not state.enabled then return end
+    if d:IsA("Model") then
+        if d:GetAttribute(SPAWN_ATTR) then
+            task.spawn(tryFarm, d)
+        else
+            local c
+            c = d:GetAttributeChangedSignal(SPAWN_ATTR):Connect(function()
+                if c then c:Disconnect(); c = nil end
+                if d:GetAttribute(SPAWN_ATTR) then task.spawn(tryFarm, d) end
+            end)
+            task.delay(10, function() if c then c:Disconnect(); c = nil end end)
+        end
+    end
+end
+
+local function onRemoving(d)
+    if d:IsA("Model") then
+        local id = d:GetAttribute(SPAWN_ATTR)
+        if id then
+            task.delay(8, function() state.processed[id] = nil end)
+        end
+    end
+end
+
+table.insert(state.conns, Workspace.DescendantAdded:Connect(onAdded))
+table.insert(state.conns, Workspace.DescendantRemoving:Connect(onRemoving))
+
+for _, d in ipairs(Workspace:GetDescendants()) do
+    if d:IsA("Model") and d:GetAttribute(SPAWN_ATTR) then
+        task.spawn(tryFarm, d)
+    end
+end
+
+function state.stop()
+    state.enabled = false
+    for _, c in ipairs(state.conns) do pcall(function() c:Disconnect() end) end
+    state.conns = {}
+    push("stopped")
+end
