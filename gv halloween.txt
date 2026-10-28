@@ -1,471 +1,386 @@
-local Players          = game:GetService("Players")
-local Workspace        = game:GetService("Workspace")
-local UserInputService = game:GetService("UserInputService")
+do
+    local CONFIG = {
+        CHECK_INTERVAL = 1,
+        HOUSE_PREFIX = "HalloweenHouse_",
+        SPAWN_WAIT = 3,
+        CANDY_WAIT = 1.5,
+        RESPAWN_WAIT = 180,
+    }
 
-local LP = Players.LocalPlayer
+    local Players = game:GetService("Players")
+    local Workspace = game:GetService("Workspace")
+    local VirtualInputManager = game:GetService("VirtualInputManager")
+    local LocalPlayer = Players.LocalPlayer
 
-if _G.HalloweenFarm and _G.HalloweenFarm.stop then
-    pcall(_G.HalloweenFarm.stop)
-end
+    local character
+    local rootPart
+    local humanoid
+    local isBusy = false
+    local savedRootCFrame = nil
+    local unusedState = nil
+    local savedCameraType = nil
+    local savedCameraSubject = nil
 
-local SPAWN_ATTR    = "HalloweenHouseSpawnId"
-local HOUSE_PREFIX  = "HalloweenHouse"
-local RETURN_AFTER  = true
-local SETTLE_TIMEOUT = 6
-local SETTLE_EPS     = 0.02
-local SETTLE_TICKS   = 3
-local PRE_RING_WAIT = 0.1
-local RING_WAIT     = 0.35
-local TOUCH_RELEASE = 0.1
-local ATTR_TIMEOUT  = 2
-local MAX_LOG       = 60
-local GUI_REFRESH   = 1
-
-local state = {
-    log           = {},
-    processed     = {},
-    knownHouses   = setmetatable({}, { __mode = "k" }),
-    doorbellCache = setmetatable({}, { __mode = "k" }),
-    farmed        = 0,
-    houseCount    = 0,
-    enabled       = true,
-    stopped       = false,
-    dirty         = true,
-    conns         = {},
-}
-_G.HalloweenFarm = state
-
-local function push(msg)
-    local log = state.log
-    if #log >= MAX_LOG then table.remove(log, 1) end
-    log[#log + 1] = string.format("[%.1f] %s", os.clock(), msg)
-    state.dirty = true
-end
-
-local function getHRP()
-    local char = LP.Character or LP.CharacterAdded:Wait()
-    return char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart", 5)
-end
-
-local PREFIX_LEN = #HOUSE_PREFIX
-local function isHouse(inst)
-    if not inst:IsA("Model") then return false end
-    if inst:GetAttribute(SPAWN_ATTR) ~= nil then return true end
-    return string.sub(inst.Name, 1, PREFIX_LEN) == HOUSE_PREFIX
-end
-
-local function waitForAttribute(inst, attr, timeout)
-    local v = inst:GetAttribute(attr)
-    if v ~= nil then return v end
-    local co = coroutine.running()
-    local resumed = false
-    local function resume()
-        if resumed then return end
-        resumed = true
-        task.spawn(co)
+    local function getCharacterParts(newCharacter)
+        character = newCharacter
+        rootPart = character:WaitForChild("HumanoidRootPart")
+        humanoid = character:WaitForChild("Humanoid")
     end
-    local conn = inst:GetAttributeChangedSignal(attr):Connect(resume)
-    task.delay(timeout, resume)
-    coroutine.yield()
-    conn:Disconnect()
-    return inst:GetAttribute(attr)
-end
 
-local function waitSettled(house)
-    local deadline = os.clock() + SETTLE_TIMEOUT
-    local last = house:GetPivot().Position
-    local still = 0
-    while os.clock() < deadline do
-        task.wait(0.1)
-        if not house.Parent then return false end
-        local p = house:GetPivot().Position
-        if (p - last).Magnitude < SETTLE_EPS then
-            still = still + 1
-            if still >= SETTLE_TICKS then return true end
-        else
-            still = 0
+    getCharacterParts(LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait())
+    LocalPlayer.CharacterAdded:Connect(function(newCharacter)
+        getCharacterParts(newCharacter)
+    end)
+
+    local function findHouseModel()
+        for _, child in ipairs(Workspace:GetChildren()) do
+            if child:IsA("Model") and string.sub(child.Name, 1, #CONFIG.HOUSE_PREFIX) == CONFIG.HOUSE_PREFIX then
+                return child
+            end
         end
-        last = p
-    end
-    return house.Parent ~= nil
-end
-
-local function nameMatches(name)
-    local n = string.lower(name)
-    return string.find(n, "bell", 1, true)
-        or string.find(n, "button", 1, true)
-        or string.find(n, "ring", 1, true)
-        or string.find(n, "press", 1, true)
-end
-
-local function metaMatches(prompt)
-    local m = string.lower(prompt.ObjectText .. " " .. prompt.ActionText)
-    return string.find(m, "bell", 1, true) or string.find(m, "ring", 1, true)
-end
-
-local function findDoorbell(house)
-    local c = state.doorbellCache[house]
-    if c then
-        if c.target.Parent and c.anchor.Parent then return c.kind, c.target, c.anchor end
-        state.doorbellCache[house] = nil
+        return nil
     end
 
-    local named, namedAnchor, metaPrompt, metaAnchor
-    local firstPrompt, firstPromptAnchor, firstClick, firstClickAnchor
+    local function findDoorPrompt(house)
+        if not house then
+            return nil
+        end
+        local firstPrompt = nil
 
-    for _, d in ipairs(house:GetDescendants()) do
-        local cls = d.ClassName
-        if cls == "ProximityPrompt" or cls == "ClickDetector" then
-            local p = d.Parent
-            if p and p:IsA("BasePart") then
-                if not named and nameMatches(d.Name) then
-                    named, namedAnchor = d, p
-                    break
+        for _, descendant in ipairs(house:GetDescendants()) do
+            if descendant:IsA("ProximityPrompt") then
+                if not firstPrompt then
+                    firstPrompt = descendant
                 end
-                if cls == "ProximityPrompt" then
-                    if not metaPrompt and metaMatches(d) then metaPrompt, metaAnchor = d, p end
-                    if not firstPrompt then firstPrompt, firstPromptAnchor = d, p end
-                elseif not firstClick then
-                    firstClick, firstClickAnchor = d, p
+                local ancestor = descendant.Parent
+                while ancestor and (ancestor ~= house) do
+                    if ancestor:IsA("Model") and string.find(string.lower(ancestor.Name), "plane") then
+                        return descendant
+                    end
+                    ancestor = ancestor.Parent
                 end
             end
-        elseif not named and d:IsA("BasePart") and nameMatches(d.Name) then
-            named, namedAnchor = d, d
+        end
+        return firstPrompt
+    end
+
+    local function getPromptWorldPosition(prompt)
+        if not prompt then
+            return nil
+        end
+        local parent = prompt.Parent
+        if parent:IsA("Attachment") then
+            return parent.WorldPosition
+        elseif parent:IsA("BasePart") then
+            return parent.Position
+        elseif parent:IsA("Model") then
+            return parent:GetPivot().Position
+        end
+        return nil
+    end
+
+    local function saveCamera()
+        local camera = Workspace.CurrentCamera
+        if not camera then
+            return
+        end
+        savedCameraType = camera.CameraType
+        savedCameraSubject = camera.CameraSubject
+    end
+
+    local function pointCameraAt(target)
+        local camera = Workspace.CurrentCamera
+        if not camera or not rootPart then
+            return
+        end
+        camera.CameraType = Enum.CameraType.Scriptable
+        camera.CFrame = CFrame.lookAt(camera.CFrame.Position, target)
+    end
+
+    local function restoreCamera()
+        local camera = Workspace.CurrentCamera
+        if not camera then
+            return
+        end
+        camera.CameraType = savedCameraType or Enum.CameraType.Custom
+        camera.CameraSubject = humanoid or savedCameraSubject
+        savedCameraType = nil
+        savedCameraSubject = nil
+    end
+
+    local function teleportTo(position)
+        if not rootPart then
+            return false
+        end
+        rootPart.Anchored = false
+        rootPart.CFrame = CFrame.new(position + Vector3.new(0, 3, 0))
+        rootPart.AssemblyLinearVelocity = Vector3.zero
+        rootPart.AssemblyAngularVelocity = Vector3.zero
+        return true
+    end
+
+    local function returnToSavedPosition()
+        if savedRootCFrame and rootPart then
+            rootPart.CFrame = savedRootCFrame
+            rootPart.AssemblyLinearVelocity = Vector3.zero
+            rootPart.AssemblyAngularVelocity = Vector3.zero
+        end
+        savedRootCFrame = nil
+        restoreCamera()
+    end
+
+    local function pressInteractKey()
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        task.wait(0.1)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+        task.wait(0.5)
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        task.wait(0.1)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end
+
+    local function tryActivatePrompt(prompt)
+        if not prompt or not prompt.Parent then
+            return false
+        end
+        local promptPosition = getPromptWorldPosition(prompt)
+        if not promptPosition then
+            return false
+        end
+
+        saveCamera()
+        local promptParent = prompt.Parent
+        local facing = Vector3.new(0, 0, 1)
+
+        if promptParent:IsA("BasePart") then
+            facing = promptParent.CFrame.LookVector
+        elseif promptParent:IsA("Attachment") and promptParent.Parent:IsA("BasePart") then
+            facing = promptParent.Parent.CFrame.LookVector
+        end
+
+        local standPosition = promptPosition + (facing * 3)
+        if not teleportTo(standPosition) then
+            restoreCamera()
+            return false
+        end
+
+        task.wait(0.3)
+        pointCameraAt(promptPosition)
+        task.wait(0.3)
+
+        if not prompt.Parent or not prompt.Enabled then
+            return false
+        end
+        local distance = (rootPart.Position - promptPosition).Magnitude
+        if distance > prompt.MaxActivationDistance then
+            return false
+        end
+
+        pressInteractKey()
+        return true
+    end
+
+    local function mainLoop()
+        while true do
+            if isBusy then
+                task.wait(CONFIG.CHECK_INTERVAL)
+                continue
+            end
+
+            local house = findHouseModel()
+            if not house then
+                task.wait(CONFIG.CHECK_INTERVAL)
+                continue
+            end
+
+            isBusy = true
+            task.wait(CONFIG.SPAWN_WAIT)
+
+            if house.Parent and rootPart then
+                savedRootCFrame = rootPart.CFrame
+                local doorPrompt = findDoorPrompt(house)
+                if doorPrompt then
+                    local activated = tryActivatePrompt(doorPrompt)
+                    if activated then
+                        task.wait(CONFIG.CANDY_WAIT)
+                    end
+                end
+                returnToSavedPosition()
+            end
+
+            isBusy = false
+            task.wait(CONFIG.RESPAWN_WAIT)
         end
     end
 
-    local function store(kind, target, anchor)
-        state.doorbellCache[house] = { kind = kind, target = target, anchor = anchor }
-        return kind, target, anchor
-    end
-
-    if named then
-        if named:IsA("ProximityPrompt") then return store("prompt", named, namedAnchor) end
-        if named:IsA("ClickDetector")   then return store("click",  named, namedAnchor) end
-        local pp = named:FindFirstChildWhichIsA("ProximityPrompt", true)
-        if pp then return store("prompt", pp, named) end
-        local cd = named:FindFirstChildWhichIsA("ClickDetector", true)
-        if cd then return store("click", cd, named) end
-        if not metaPrompt then return store("touch", named, named) end
-    end
-    if metaPrompt  then return store("prompt", metaPrompt,  metaAnchor)        end
-    if firstPrompt then return store("prompt", firstPrompt, firstPromptAnchor) end
-    if firstClick  then return store("click",  firstClick,  firstClickAnchor)  end
-    return nil
+    task.spawn(mainLoop)
 end
-
-local busy = false
-
-local function fire(kind, target, anchor)
-    while busy do task.wait(0.05) end
-    busy = true
-
-    local hrp = getHRP()
-    if not hrp or not anchor or not anchor:IsA("BasePart") then
-        busy = false
-        push("no HRP or bad anchor; abort")
-        return false
-    end
-    local origin      = hrp.CFrame
-    local wasAnchored = hrp.Anchored
-
-    hrp.Anchored = true
-    hrp.AssemblyLinearVelocity  = Vector3.zero
-    hrp.AssemblyAngularVelocity = Vector3.zero
-    hrp.CFrame = anchor.CFrame * CFrame.new(0, 0, -2)
-    task.wait(PRE_RING_WAIT)
-
-    local ok = false
-    if kind == "prompt" then
-        ok = pcall(fireproximityprompt, target, 1)
-        task.wait(RING_WAIT)
-    elseif kind == "click" then
-        ok = pcall(fireclickdetector, target, 0, "MouseClick")
-        task.wait(RING_WAIT)
-    elseif kind == "touch" then
-        ok = pcall(firetouchinterest, hrp, target, 0)
-        task.wait(TOUCH_RELEASE)
-        pcall(firetouchinterest, hrp, target, 1)
-        task.wait(RING_WAIT)
-    end
-
-    if RETURN_AFTER and hrp.Parent then
-        hrp.CFrame = origin
-        hrp.AssemblyLinearVelocity  = Vector3.zero
-        hrp.AssemblyAngularVelocity = Vector3.zero
-    end
-    hrp.Anchored = wasAnchored
-    busy = false
-    return ok
-end
-
-local function tryFarm(house)
-    if not state.enabled or state.stopped or not house.Parent then return end
-
-    local id = waitForAttribute(house, SPAWN_ATTR, ATTR_TIMEOUT)
-    if not id or state.processed[id] then return end
-    state.processed[id] = true
-
-    push("house " .. tostring(id):sub(1, 8) .. " waiting to settle")
-    waitSettled(house)
-
-    if not state.enabled or state.stopped or not house.Parent then
-        state.processed[id] = nil
-        return
-    end
-
-    local kind, target, anchor = findDoorbell(house)
-    if not kind then
-        push("no interactable found inside house")
-        return
-    end
-    if fire(kind, target, anchor) then
-        state.farmed = state.farmed + 1
-        push("rang via " .. kind)
-    else
-        push("fire failed on " .. kind)
-    end
-end
-
-local function registerHouse(inst)
-    if state.knownHouses[inst] then return end
-    state.knownHouses[inst] = true
-    state.houseCount = state.houseCount + 1
-    state.dirty = true
-    if state.enabled then task.spawn(tryFarm, inst) end
-end
-
-local function onChildRemoved(d)
-    if not state.knownHouses[d] then return end
-    state.knownHouses[d] = nil
-    state.doorbellCache[d] = nil
-    state.houseCount = math.max(0, state.houseCount - 1)
-    state.dirty = true
-    local id = d:GetAttribute(SPAWN_ATTR)
-    if id then
-        task.delay(8, function() state.processed[id] = nil end)
-    end
-end
-
-table.insert(state.conns, Workspace.ChildAdded:Connect(function(d)
-    if isHouse(d) then registerHouse(d) end
-end))
-table.insert(state.conns, Workspace.ChildRemoved:Connect(onChildRemoved))
-
-for _, d in ipairs(Workspace:GetChildren()) do
-    if isHouse(d) then registerHouse(d) end
-end
-
-local ORANGE     = Color3.fromRGB(255, 125, 30)
-local ORANGE_DIM = Color3.fromRGB(140, 70, 20)
-local BG         = Color3.fromRGB(22, 18, 28)
-local BG_LIGHT   = Color3.fromRGB(36, 28, 44)
-local TEXT       = Color3.fromRGB(240, 230, 220)
-local GREEN      = Color3.fromRGB(80, 200, 110)
-local RED        = Color3.fromRGB(220, 70, 70)
-
-local function mkCorner(parent, radius)
-    local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, radius or 6)
-    c.Parent = parent
-    return c
-end
-local function mkStroke(parent, color, thick)
-    local s = Instance.new("UIStroke")
-    s.Color = color
-    s.Thickness = thick or 1
-    s.Parent = parent
-    return s
-end
-
-local guiParent
-local okHui, hui = pcall(function() return gethui() end)
-if okHui and hui then
-    guiParent = hui
-else
-    guiParent = game:GetService("CoreGui")
-end
-
-local existing = guiParent:FindFirstChild("HalloweenFarmGui")
-if existing then existing:Destroy() end
-
-local gui = Instance.new("ScreenGui")
-gui.Name = "HalloweenFarmGui"
-gui.IgnoreGuiInset = true
-gui.ResetOnSpawn = false
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-gui.Parent = guiParent
-
-local main = Instance.new("Frame")
-main.Name = "Main"
-main.Size = UDim2.fromOffset(220, 140)
-main.Position = UDim2.fromOffset(20, 120)
-main.BackgroundColor3 = BG
-main.BorderSizePixel = 0
-main.Active = true
-main.Parent = gui
-mkCorner(main, 8)
-mkStroke(main, ORANGE, 1)
-
-local titleBar = Instance.new("Frame")
-titleBar.Size = UDim2.new(1, 0, 0, 26)
-titleBar.BackgroundColor3 = BG_LIGHT
-titleBar.BorderSizePixel = 0
-titleBar.Parent = main
-mkCorner(titleBar, 8)
-
-local titleFix = Instance.new("Frame")
-titleFix.Size = UDim2.new(1, 0, 0.5, 0)
-titleFix.Position = UDim2.fromScale(0, 0.5)
-titleFix.BackgroundColor3 = BG_LIGHT
-titleFix.BorderSizePixel = 0
-titleFix.Parent = titleBar
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -32, 1, 0)
-title.Position = UDim2.fromOffset(8, 0)
-title.BackgroundTransparency = 1
-title.Font = Enum.Font.GothamBold
-title.TextSize = 14
-title.TextColor3 = ORANGE
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Text = "Halloween Farm"
-title.Parent = titleBar
-
-local closeBtn = Instance.new("TextButton")
-closeBtn.Size = UDim2.fromOffset(22, 22)
-closeBtn.Position = UDim2.new(1, -24, 0, 2)
-closeBtn.BackgroundColor3 = BG
-closeBtn.BorderSizePixel = 0
-closeBtn.Font = Enum.Font.GothamBold
-closeBtn.TextSize = 14
-closeBtn.TextColor3 = TEXT
-closeBtn.Text = "x"
-closeBtn.AutoButtonColor = false
-closeBtn.Parent = titleBar
-mkCorner(closeBtn, 4)
-
-local toggle = Instance.new("TextButton")
-toggle.Size = UDim2.new(1, -16, 0, 28)
-toggle.Position = UDim2.fromOffset(8, 34)
-toggle.BackgroundColor3 = GREEN
-toggle.BorderSizePixel = 0
-toggle.Font = Enum.Font.GothamBold
-toggle.TextSize = 13
-toggle.TextColor3 = Color3.fromRGB(255, 255, 255)
-toggle.Text = "ON"
-toggle.AutoButtonColor = false
-toggle.Parent = main
-mkCorner(toggle, 6)
-
-local function mkStat(y, labelText)
-    local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, -16, 0, 14)
-    row.Position = UDim2.fromOffset(8, y)
-    row.BackgroundTransparency = 1
-    row.Parent = main
-
-    local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(0, 55, 1, 0)
-    lbl.BackgroundTransparency = 1
-    lbl.Font = Enum.Font.Gotham
-    lbl.TextSize = 11
-    lbl.TextColor3 = ORANGE_DIM
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.Text = labelText
-    lbl.Parent = row
-
-    local val = Instance.new("TextLabel")
-    val.Size = UDim2.new(1, -55, 1, 0)
-    val.Position = UDim2.fromOffset(55, 0)
-    val.BackgroundTransparency = 1
-    val.Font = Enum.Font.GothamMedium
-    val.TextSize = 11
-    val.TextColor3 = TEXT
-    val.TextXAlignment = Enum.TextXAlignment.Left
-    val.TextTruncate = Enum.TextTruncate.AtEnd
-    val.Text = "..."
-    val.Parent = row
-    return val
-end
-
-local statFarmed = mkStat(70, "Farmed")
-local statHouses = mkStat(88, "Houses")
-local statLast   = mkStat(106, "Last")
-
-local function applyEnabled(on)
-    state.enabled = on and true or false
-    if state.enabled then
-        toggle.Text = "ON"
-        toggle.BackgroundColor3 = GREEN
-        push("enabled")
-        for house in pairs(state.knownHouses) do
-            if house.Parent then task.spawn(tryFarm, house) end
-        end
-    else
-        toggle.Text = "OFF"
-        toggle.BackgroundColor3 = RED
-        push("disabled")
-    end
-end
-
-function state.setEnabled(v) applyEnabled(v) end
-toggle.MouseButton1Click:Connect(function() applyEnabled(not state.enabled) end)
 
 do
-    local dragging, dragStart, startPos
-    titleBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-           or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPos  = main.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
-        end
+    local Players = game:GetService("Players")
+    local LocalPlayer = Players.LocalPlayer
+    if not LocalPlayer then
+        warn("Dieses Script muss clientseitig laufen.")
+        return
+    end
+
+    local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+    local existingPopup = playerGui:FindFirstChild("CreatorPopup")
+    if existingPopup then
+        existingPopup:Destroy()
+    end
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "CreatorPopup"
+    screenGui.ResetOnSpawn = false
+    screenGui.DisplayOrder = 999
+    screenGui.IgnoreGuiInset = true
+    screenGui.Parent = playerGui
+
+    local popupFrame = Instance.new("Frame")
+    popupFrame.Name = "Popup"
+    popupFrame.Size = UDim2.fromOffset(300, 90)
+    popupFrame.Position = UDim2.new(1, 320, 1, -110)
+    popupFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    popupFrame.BorderSizePixel = 0
+    popupFrame.Parent = screenGui
+
+    Instance.new("UICorner", popupFrame).CornerRadius = UDim.new(0, 8)
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(65, 65, 65)
+    stroke.Thickness = 1
+    stroke.Parent = popupFrame
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size = UDim2.new(1, -45, 0, 30)
+    titleLabel.Position = UDim2.fromOffset(14, 8)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = "Script Von Skibidi_wopper1"
+    titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    titleLabel.TextSize = 16
+    titleLabel.Font = Enum.Font.BuilderSansBold
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Parent = popupFrame
+
+    local messageLabel = Instance.new("TextLabel")
+    messageLabel.Size = UDim2.new(1, -28, 0, 25)
+    messageLabel.Position = UDim2.fromOffset(14, 43)
+    messageLabel.BackgroundTransparency = 1
+    messageLabel.Text = "Viel Spaß mit Deinen Candy Corn!\nZum Deaktivieren Rejoinen!"
+    messageLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+    messageLabel.TextSize = 13
+    messageLabel.Font = Enum.Font.BuilderSans
+    messageLabel.TextXAlignment = Enum.TextXAlignment.Left
+    messageLabel.Parent = popupFrame
+
+    local closeButton = Instance.new("TextButton")
+    closeButton.Size = UDim2.fromOffset(28, 28)
+    closeButton.Position = UDim2.new(1, -34, 0, 7)
+    closeButton.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+    closeButton.BorderSizePixel = 0
+    closeButton.Text = "X"
+    closeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeButton.TextSize = 13
+    closeButton.Font = Enum.Font.BuilderSansBold
+    closeButton.Parent = popupFrame
+
+    Instance.new("UICorner", closeButton).CornerRadius = UDim.new(0, 5)
+
+    closeButton.MouseButton1Click:Connect(function()
+        screenGui:Destroy()
     end)
-    table.insert(state.conns, UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-                        or input.UserInputType == Enum.UserInputType.Touch) then
-            local delta = input.Position - dragStart
-            main.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + delta.X,
-                startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-        end
-    end))
+
+    popupFrame:TweenPosition(
+        UDim2.new(1, -315, 1, -110),
+        Enum.EasingDirection.Out,
+        Enum.EasingStyle.Quart,
+        0.35,
+        true
+    )
 end
 
-function state.stop()
-    if state.stopped then return end
-    state.stopped = true
-    state.enabled = false
-    for _, c in ipairs(state.conns) do pcall(function() c:Disconnect() end) end
-    state.conns = {}
-    pcall(function()
-        local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
-        if hrp then hrp.Anchored = false end
-    end)
-    if gui and gui.Parent then gui:Destroy() end
-    _G.HalloweenFarm = nil
-end
-closeBtn.MouseButton1Click:Connect(function() state.stop() end)
+do
+    local Players = game:GetService("Players")
+    local LocalPlayer = Players.LocalPlayer
+    if not LocalPlayer then
+        warn("LocalPlayer nicht gefunden")
+        return
+    end
 
-task.spawn(function()
-    while gui.Parent and not state.stopped do
-        if state.dirty then
-            state.dirty = false
-            statFarmed.Text = tostring(state.farmed)
-            statHouses.Text = tostring(state.houseCount)
-            local lastLine = state.log[#state.log]
-            if lastLine then
-                statLast.Text = (string.gsub(lastLine, "^%[[^%]]+%]%s*", ""))
+    local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+    local OWNER_NAME = "Skibidi_Wopper1"
+    local SHOW_DISTANCE = 50
+
+    local ownerTag
+    local trackedCharacter
+
+    local function removeOwnerTag()
+        if ownerTag then
+            ownerTag:Destroy()
+            ownerTag = nil
+        end
+        trackedCharacter = nil
+    end
+
+    local function updateOwnerTag()
+        local ownerPlayer = Players:FindFirstChild(OWNER_NAME)
+        if not ownerPlayer then
+            removeOwnerTag()
+            return
+        end
+
+        local ownerCharacter = ownerPlayer.Character
+        local ownerHead = ownerCharacter and ownerCharacter:FindFirstChild("Head")
+        if not ownerHead then
+            removeOwnerTag()
+            return
+        end
+
+        if (trackedCharacter ~= ownerCharacter) or not ownerTag or not ownerTag.Parent then
+            removeOwnerTag()
+            trackedCharacter = ownerCharacter
+
+            ownerTag = Instance.new("BillboardGui")
+            ownerTag.Name = "CandyFarmOwnerTag"
+            ownerTag.Adornee = ownerHead
+            ownerTag.Size = UDim2.fromOffset(300, 35)
+            ownerTag.StudsOffset = Vector3.new(0, 3.5, 0)
+            ownerTag.AlwaysOnTop = true
+            ownerTag.Enabled = false
+            ownerTag.Parent = playerGui
+
+            local tagLabel = Instance.new("TextLabel")
+            tagLabel.Size = UDim2.fromScale(1, 1)
+            tagLabel.BackgroundTransparency = 1
+            tagLabel.Text = "Candy Farm Owner"
+            tagLabel.TextColor3 = Color3.new(1, 1, 1)
+            tagLabel.TextStrokeTransparency = 0
+            tagLabel.Font = Enum.Font.BuilderSansBold
+            tagLabel.TextSize = 24
+            tagLabel.ZIndex = 10
+            tagLabel.Parent = ownerTag
+        end
+
+        local myCharacter = LocalPlayer.Character
+        local myRoot = myCharacter and myCharacter:FindFirstChild("HumanoidRootPart")
+        local ownerRoot = ownerCharacter:FindFirstChild("HumanoidRootPart")
+        if not myRoot or not ownerRoot then
+            ownerTag.Enabled = false
+            return
+        end
+
+        ownerTag.Enabled = (myRoot.Position - ownerRoot.Position).Magnitude <= SHOW_DISTANCE
+    end
+
+    task.spawn(function()
+        while task.wait(0.25) do
+            local ok, err = pcall(updateOwnerTag)
+            if not ok then
+                warn("Owner Tag:", err)
             end
         end
-        task.wait(GUI_REFRESH)
-    end
-end)
-
-push("auto-farm armed; waiting for houses")
+    end)
+end
